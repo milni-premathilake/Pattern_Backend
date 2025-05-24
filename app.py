@@ -4,110 +4,136 @@ import numpy as np
 import base64
 import io
 import os
-import tensorflow as tf
-from PIL import Image
-from tensorflow.keras.models import load_model
-from azure.storage.blob import BlobServiceClient
 import tempfile
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
 
-# Azure Blob Storage configuration
-AZURE_STORAGE_CONNECTION_STRING = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
-CONTAINER_NAME = "models"
+# Initialize variables
+shape_model = None
+number_model = None
+model_load_error = None
 
-# Configure TensorFlow
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
-
-print(f"Using TensorFlow version: {tf.__version__}")
-
-def download_model_from_blob(blob_name):
-    """Download model from Azure Blob Storage to temporary file"""
-    try:
-        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_name)
-        
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(blob_name)[1])
-        
-        # Download blob to temporary file
-        with open(temp_file.name, "wb") as download_file:
-            download_file.write(blob_client.download_blob().readall())
-        
-        return temp_file.name
-    except Exception as e:
-        print(f"Error downloading {blob_name}: {e}")
-        return None
-
-# Load models from Azure Blob Storage
-try:
-    shape_model = None
-    number_model = None
+def load_models():
+    global shape_model, number_model, model_load_error
     
-    if AZURE_STORAGE_CONNECTION_STRING:
-        # Try different model file names
-        model_files = [
-            ('shape_recognition_model.keras', 'shape'),
-            ('shape_recognition_model.h5', 'shape'),
-            ('best_digit_reversal_model.keras', 'number'),
-            ('best_digit_reversal_model.h5', 'number')
-        ]
+    try:
+        import tensorflow as tf
+        print(f"TensorFlow version: {tf.__version__}")
         
-        shape_model_path = None
-        number_model_path = None
+        # Configure TensorFlow for Azure
+        tf.get_logger().setLevel('ERROR')  # Reduce log verbosity
         
-        for filename, model_type in model_files:
-            temp_path = download_model_from_blob(filename)
-            if temp_path:
-                if model_type == 'shape' and shape_model is None:
+        # Try Azure Storage first
+        connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+        if connection_string:
+            print("Attempting to load models from Azure Storage...")
+            from azure.storage.blob import BlobServiceClient
+            
+            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            container_name = "models"
+            
+            # Download and load models
+            model_files = [
+                ('shape_recognition_model.keras', 'shape'),
+                ('shape_recognition_model.h5', 'shape'),
+                ('best_digit_reversal_model.keras', 'number'),
+                ('best_digit_reversal_model.h5', 'number')
+            ]
+            
+            for filename, model_type in model_files:
+                try:
+                    blob_client = blob_service_client.get_blob_client(
+                        container=container_name, blob=filename
+                    )
+                    
+                    # Create temporary file
+                    temp_file = tempfile.NamedTemporaryFile(
+                        delete=False, suffix=os.path.splitext(filename)[1]
+                    )
+                    
+                    # Download blob
+                    with open(temp_file.name, "wb") as download_file:
+                        download_file.write(blob_client.download_blob().readall())
+                    
+                    # Load model
+                    model = tf.keras.models.load_model(temp_file.name, compile=False)
+                    
+                    if model_type == 'shape' and shape_model is None:
+                        shape_model = model
+                        print(f"Shape model loaded from {filename}")
+                    elif model_type == 'number' and number_model is None:
+                        number_model = model
+                        print(f"Number model loaded from {filename}")
+                    
+                    # Clean up temp file
+                    os.unlink(temp_file.name)
+                    
+                except Exception as e:
+                    print(f"Failed to load {filename}: {e}")
+                    continue
+        
+        # Fallback to local files
+        if shape_model is None or number_model is None:
+            print("Attempting to load models from local files...")
+            local_files = [
+                ('shape_recognition_model.keras', 'shape'),
+                ('shape_recognition_model.h5', 'shape'),
+                ('best_digit_reversal_model.keras', 'number'),
+                ('best_digit_reversal_model.h5', 'number')
+            ]
+            
+            for filename, model_type in local_files:
+                if os.path.exists(filename):
                     try:
-                        shape_model = load_model(temp_path, compile=False)
-                        shape_model_path = temp_path
-                        print(f"Loaded shape model from {filename}")
+                        model = tf.keras.models.load_model(filename, compile=False)
+                        if model_type == 'shape' and shape_model is None:
+                            shape_model = model
+                            print(f"Shape model loaded from local {filename}")
+                        elif model_type == 'number' and number_model is None:
+                            number_model = model
+                            print(f"Number model loaded from local {filename}")
                     except Exception as e:
-                        print(f"Failed to load shape model from {filename}: {e}")
-                        os.unlink(temp_path)
-                elif model_type == 'number' and number_model is None:
-                    try:
-                        number_model = load_model(temp_path, compile=False)
-                        number_model_path = temp_path
-                        print(f"Loaded number model from {filename}")
-                    except Exception as e:
-                        print(f"Failed to load number model from {filename}: {e}")
-                        os.unlink(temp_path)
-    else:
-        print("Azure Storage connection string not found in environment variables")
+                        print(f"Failed to load local {filename}: {e}")
         
-    if shape_model is None or number_model is None:
-        print("Warning: Some models could not be loaded")
-        
-except Exception as e:
-    print(f"Error loading models: {e}")
-    shape_model = None
-    number_model = None
+        if shape_model is None or number_model is None:
+            model_load_error = "Could not load all required models"
+            print(model_load_error)
+        else:
+            print("All models loaded successfully")
+            
+    except Exception as e:
+        model_load_error = f"Model loading error: {str(e)}"
+        print(model_load_error)
 
-# Rest of your existing code remains the same...
+# Load models on startup
+load_models()
+
 SHAPE_CLASSES = ['circle', 'square', 'triangle']
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'models_loaded': {
+            'shape_model': shape_model is not None,
+            'number_model': number_model is not None
+        },
+        'model_load_error': model_load_error,
+        'environment': os.environ.get('WEBSITE_SITE_NAME', 'local')
+    })
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    # Your existing predict function code...
     if shape_model is None or number_model is None:
         return jsonify({
             'success': False,
-            'error': 'Models could not be loaded. Check server logs.'
+            'error': f'Models not available. Error: {model_load_error}'
         }), 500
 
     data = request.json
-    
-    if not data or 'image' not in data or not data['image'] or 'modelType' not in data:
+    if not data or 'image' not in data or 'modelType' not in data:
         return jsonify({
             'success': False,
             'error': 'Missing image data or model type'
@@ -171,4 +197,5 @@ def predict():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print(f"Starting Flask app on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)

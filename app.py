@@ -7,11 +7,17 @@ import os
 import tensorflow as tf
 from PIL import Image
 from tensorflow.keras.models import load_model
+from azure.storage.blob import BlobServiceClient
+import tempfile
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes to allow requests from your React frontend
+CORS(app)
 
-# Configure TensorFlow to use less memory and avoid version conflicts
+# Azure Blob Storage configuration
+AZURE_STORAGE_CONNECTION_STRING = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+CONTAINER_NAME = "models"
+
+# Configure TensorFlow
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
@@ -20,60 +26,78 @@ if gpus:
     except RuntimeError as e:
         print(e)
 
-# Print TensorFlow version for debugging
 print(f"Using TensorFlow version: {tf.__version__}")
 
-# Load models with version-specific handling
+def download_model_from_blob(blob_name):
+    """Download model from Azure Blob Storage to temporary file"""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_name)
+        
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(blob_name)[1])
+        
+        # Download blob to temporary file
+        with open(temp_file.name, "wb") as download_file:
+            download_file.write(blob_client.download_blob().readall())
+        
+        return temp_file.name
+    except Exception as e:
+        print(f"Error downloading {blob_name}: {e}")
+        return None
+
+# Load models from Azure Blob Storage
 try:
-    model_formats = [
-        # Try different file extensions and paths in this order
-        ('.keras', ''),           # shape_recognition_model.keras in current dir
-        ('.h5', ''),              # shape_recognition_model.h5 in current dir  
-        ('.keras', '../models/'),  # shape_recognition_model.keras in models dir
-        ('.h5', '../models/')      # shape_recognition_model.h5 in models dir
-    ]
-    
     shape_model = None
     number_model = None
     
-    # Try loading each format until successful
-    for ext, path in model_formats:
-        try:
-            shape_path = f"{path}shape_recognition_model{ext}"
-            number_path = f"{path}best_digit_reversal_model{ext}"
-            
-            # Check if files exist
-            if not os.path.exists(shape_path) or not os.path.exists(number_path):
-                print(f"Files not found: {shape_path} or {number_path}")
-                continue
-                
-            print(f"Attempting to load models from: {shape_path} and {number_path}")
-            
-            # Custom object scope for backward compatibility
-            shape_model = load_model(shape_path, compile=False)
-            number_model = load_model(number_path, compile=False)
-            
-            print(f"Successfully loaded models with format: {ext} from path: {path}")
-            break
-        except Exception as model_error:
-            print(f"Failed loading {ext} format from {path}: {model_error}")
-    
-    if shape_model is None or number_model is None:
-        raise Exception("Could not load models in any format")
+    if AZURE_STORAGE_CONNECTION_STRING:
+        # Try different model file names
+        model_files = [
+            ('shape_recognition_model.keras', 'shape'),
+            ('shape_recognition_model.h5', 'shape'),
+            ('best_digit_reversal_model.keras', 'number'),
+            ('best_digit_reversal_model.h5', 'number')
+        ]
         
-    print("Models loaded successfully")
+        shape_model_path = None
+        number_model_path = None
+        
+        for filename, model_type in model_files:
+            temp_path = download_model_from_blob(filename)
+            if temp_path:
+                if model_type == 'shape' and shape_model is None:
+                    try:
+                        shape_model = load_model(temp_path, compile=False)
+                        shape_model_path = temp_path
+                        print(f"Loaded shape model from {filename}")
+                    except Exception as e:
+                        print(f"Failed to load shape model from {filename}: {e}")
+                        os.unlink(temp_path)
+                elif model_type == 'number' and number_model is None:
+                    try:
+                        number_model = load_model(temp_path, compile=False)
+                        number_model_path = temp_path
+                        print(f"Loaded number model from {filename}")
+                    except Exception as e:
+                        print(f"Failed to load number model from {filename}: {e}")
+                        os.unlink(temp_path)
+    else:
+        print("Azure Storage connection string not found in environment variables")
+        
+    if shape_model is None or number_model is None:
+        print("Warning: Some models could not be loaded")
+        
 except Exception as e:
     print(f"Error loading models: {e}")
-    # Initialize with None to handle gracefully if models can't be loaded
     shape_model = None
     number_model = None
 
-# Class labels for shape model
+# Rest of your existing code remains the same...
 SHAPE_CLASSES = ['circle', 'square', 'triangle']
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint to verify the API is running"""
     return jsonify({
         'status': 'ok',
         'models_loaded': {
@@ -84,15 +108,13 @@ def health_check():
 
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    """Endpoint to process the image and make predictions"""
-    # Check if models were loaded successfully
+    # Your existing predict function code...
     if shape_model is None or number_model is None:
         return jsonify({
             'success': False,
             'error': 'Models could not be loaded. Check server logs.'
         }), 500
 
-    # Get JSON data from request
     data = request.json
     
     if not data or 'image' not in data or not data['image'] or 'modelType' not in data:
@@ -102,24 +124,16 @@ def predict():
         }), 400
 
     try:
-        # Get model type (shape or number)
         model_type = data['modelType']
-        
-        # Process the base64 image
         image_data = data['image'].split(',')[1] if ',' in data['image'] else data['image']
         image_bytes = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(image_bytes)).convert('L')
         
-        # Convert to image
-        image = Image.open(io.BytesIO(image_bytes)).convert('L')  # Convert to grayscale
-        
-        # Process based on model type
         if model_type == 'shape':
-            # Preprocess for shape model
             image_resized = image.resize((64, 64))
             image_array = np.array(image_resized.convert('RGB')) / 255.0
             image_array = np.expand_dims(image_array, axis=0)
             
-            # Make prediction
             prediction = shape_model.predict(image_array)
             predicted_class_idx = np.argmax(prediction[0])
             confidence = float(prediction[0][predicted_class_idx])
@@ -131,28 +145,21 @@ def predict():
             }
             
         elif model_type == 'number':
-            # Preprocess for number model
             image_resized = image.resize((28, 28))
             image_array = np.array(image_resized)
-            
-            # Invert the image (MNIST is white on black, but canvas is black on white)
             image_array = np.invert(image_array)
-            
-            # Normalize
             image_array = image_array / 255.0
             image_array = image_array.reshape(1, 28, 28, 1)
             
-            # Make prediction
             prediction = number_model.predict(image_array)
             predicted_class_idx = np.argmax(prediction[0])
             confidence = float(prediction[0][predicted_class_idx])
             
             result = {
-                'class': str(predicted_class_idx),  # Convert digit to string
+                'class': str(predicted_class_idx),
                 'confidence': confidence,
                 'all_scores': {str(i): float(prediction[0][i]) for i in range(10)}
             }
-            
         else:
             return jsonify({
                 'success': False,
@@ -172,7 +179,6 @@ def predict():
             'error': str(e)
         }), 500
 
-# Azure App Service expects the app to run on the port specified by the PORT environment variable
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)

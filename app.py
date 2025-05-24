@@ -96,16 +96,6 @@ except Exception as e:
 # Rest of your existing code remains the same...
 SHAPE_CLASSES = ['circle', 'square', 'triangle']
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'ok',
-        'models_loaded': {
-            'shape_model': shape_model is not None,
-            'number_model': number_model is not None
-        }
-    })
-
 @app.route('/api/predict', methods=['POST'])
 def predict():
     # Your existing predict function code...
